@@ -2,12 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
-	"math"
+	"math/rand/v2"
+	"strconv"
+
+	// "math"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
@@ -18,28 +19,20 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-const (
-	windowSize      = 50
-	zScoreThreshold = 2.0
-	redisKeyPrefix  = "metric:"
-)
-
 var (
 	ctx = context.Background()
 
 	// Prometheus metrics
 	rpsCounter = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "service_rps_total",
-			Help: "Total requests per second",
+			Name: "rps_total",
 		},
 		[]string{"status"},
 	)
 
 	latencyHistogram = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "service_latency_seconds",
-			Help:    "Request latency in seconds",
+			Name:    "latency_seconds",
 			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"endpoint"},
@@ -47,230 +40,182 @@ var (
 
 	anomalyCounter = promauto.NewCounter(
 		prometheus.CounterOpts{
-			Name: "service_anomalies_total",
-			Help: "Total number of detected anomalies",
-		},
-	)
-
-	anomalyRateGauge = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "service_anomaly_rate",
-			Help: "Current anomaly rate",
+			Name: "anomalies_total",
 		},
 	)
 
 	predictionGauge = promauto.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "service_prediction_value",
-			Help: "Predicted value using rolling average",
+			Name: "prediction_value",
 		},
 	)
 )
 
-type Metric struct {
-	Timestamp int64   `json:"timestamp"` // Unix timestamp in seconds
-	CPU       float64 `json:"cpu"`
-	RPS       float64 `json:"rps"`
-}
-
 type Analytics struct {
-	mu              sync.RWMutex
-	rollingWindow   []float64
-	anomalyCount    int64
-	totalMetrics    int64
-	prediction      float64
-	mean            float64
-	stdDev          float64
-	anomalyRate     float64
+	totalCount   int64
+	anomalyCount int64
+	prediction   float64
 }
 
 type Service struct {
-	redis    *redis.Client
+	mutex     sync.RWMutex
+	redis     *redis.Client
 	analytics *Analytics
 }
 
-func NewService(redisAddr string) (*Service, error) {
-	rdb := redis.NewClient(&redis.Options{
+func NewService(redisAddr string, password string) (*Service, error) {
+	redis := redis.NewClient(&redis.Options{
 		Addr:         redisAddr,
-		Password:     "",
+		Password:     password,
 		DB:           0,
 		PoolSize:     10,
 		MinIdleConns: 5,
 	})
 
-	// Test connection
-	if err := rdb.Ping(ctx).Err(); err != nil {
+	if err := redis.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 
 	return &Service{
-		redis: rdb,
+		redis: redis,
 		analytics: &Analytics{
-			rollingWindow: make([]float64, 0, windowSize),
+			totalCount:   0,
+			anomalyCount: 0,
+			prediction:   0,
 		},
 	}, nil
 }
 
-func (s *Service) ingestMetric(c *gin.Context) {
-	start := time.Now()
-	var metric Metric
+func (service *Service) predictFromSuperAI() float64 {
+	return rand.Float64()
+}
 
-	if err := c.ShouldBindJSON(&metric); err != nil {
-		rpsCounter.WithLabelValues("error").Inc()
+// Функция для расчёта скользящего среднего (moving average)
+func (service *Service) rollingAverage(metricName string, newValue float64, windowSize int64) float64 {
+	key := fmt.Sprintf("%s:rolling", metricName)
+	vals, err := service.redis.LRange(ctx, key, 0, -1).Result()
+	if err != nil && err != redis.Nil {
+		log.Println(err)
+		return newValue
+	}
+
+	var sum float64
+	for _, v := range vals {
+		fv, _ := strconv.ParseFloat(v, 64)
+		sum += fv
+	}
+
+	newSum := sum + newValue
+	service.redis.RPush(ctx, key, newValue)
+	service.redis.LTrim(ctx, key, -(windowSize + 1), -1)
+	var predict = service.predictFromSuperAI()
+	service.analytics.prediction = predict
+	predictionGauge.Set(predict)
+
+	return newSum / float64(len(vals)+1)
+}
+
+// Функция для вычисления отклонения (z-score) и детекции аномалий
+func (service *Service) detectAnomaly(metricName string, newValue float64) bool {
+	keyMean := fmt.Sprintf("%s:mean", metricName)
+	keyStdDev := fmt.Sprintf("%s:stddev", metricName)
+
+	meanStr, _ := service.redis.Get(ctx, keyMean).Result()
+	stdDevStr, err := service.redis.Get(ctx, keyStdDev).Result()
+
+	if err != nil || meanStr == "" || stdDevStr == "" {
+		return false // Недостаточно данных для анализа
+	}
+
+	mean, _ := strconv.ParseFloat(meanStr, 64)
+	stdDev, _ := strconv.ParseFloat(stdDevStr, 64)
+	zScore := (newValue - mean) / stdDev
+
+	return service.abs(zScore) > 3 // Если z-score превышает 3, считаем это аномалией
+}
+
+// Вспомогательная функция для нахождения модуля числа
+func (service *Service) abs(x float64) float64 {
+	if x >= 0 {
+		return x
+	}
+	return -x
+}
+
+// Маршрутизатор для обработки входящих метрик
+func (service *Service) handleMetrics(c *gin.Context) {
+	var m MetricDto
+	if err := c.ShouldBindJSON(&m); err != nil { // Привязываем тело запроса к структуре Metric
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		rpsCounter.WithLabelValues("error").Inc()
 		return
 	}
 
-	// If timestamp is 0 or not provided, use current time
-	if metric.Timestamp == 0 {
-		metric.Timestamp = time.Now().Unix()
+	// Сохраняем исходное значение в Redis
+	valueKey := fmt.Sprintf("%s:%d", m.Name, m.Timestamp)
+	service.redis.Set(ctx, valueKey, m.Value, time.Hour*24)
+
+	// Рассчитываем rolling average
+	var windowSize int64 = 10
+	avg := service.rollingAverage(m.Name, m.Value, windowSize)
+	fmt.Printf("Rolling avg for %s at timestamp %d is %.2f\n", m.Name, m.Timestamp, avg)
+
+	// Проверяем наличие аномалий
+	isAnomaly := service.detectAnomaly(m.Name, m.Value)
+	if isAnomaly {
+		service.analytics.anomalyCount++
+		anomalyCounter.Inc()
+		log.Printf("ANOMALY DETECTED: Value %f exceeds normal distribution bounds!\n", m.Value)
 	}
 
-	// Store in Redis with expiration
-	key := fmt.Sprintf("%s%d", redisKeyPrefix, metric.Timestamp)
-	data, _ := json.Marshal(metric)
-	if err := s.redis.Set(ctx, key, data, 10*time.Minute).Err(); err != nil {
-		log.Printf("Failed to cache metric: %v", err)
-	}
-
-	// Process metric through analytics in background
-	go s.processMetricValue(metric.RPS)
-
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("Received metric '%s' with value %.2f", m.Name, m.Value)})
 	rpsCounter.WithLabelValues("success").Inc()
-	latencyHistogram.WithLabelValues("ingest").Observe(time.Since(start).Seconds())
-
-	c.JSON(http.StatusOK, gin.H{
-		"status":  "ok",
-		"message": "Metric ingested successfully",
-	})
+	service.analytics.totalCount++
 }
 
-func (s *Service) processMetricValue(rps float64) {
-	s.analytics.mu.Lock()
-	defer s.analytics.mu.Unlock()
-
-	// Add to rolling window
-	if len(s.analytics.rollingWindow) >= windowSize {
-		s.analytics.rollingWindow = s.analytics.rollingWindow[1:]
-	}
-	s.analytics.rollingWindow = append(s.analytics.rollingWindow, rps)
-
-	// Calculate rolling average (prediction)
-	if len(s.analytics.rollingWindow) > 0 {
-		sum := 0.0
-		for _, v := range s.analytics.rollingWindow {
-			sum += v
-		}
-		s.analytics.prediction = sum / float64(len(s.analytics.rollingWindow))
-		predictionGauge.Set(s.analytics.prediction)
-	}
-
-	// Calculate mean and std dev for z-score
-	if len(s.analytics.rollingWindow) >= windowSize {
-		mean := 0.0
-		for _, v := range s.analytics.rollingWindow {
-			mean += v
-		}
-		mean /= float64(len(s.analytics.rollingWindow))
-		s.analytics.mean = mean
-
-		// Calculate standard deviation
-		variance := 0.0
-		for _, v := range s.analytics.rollingWindow {
-			variance += (v - mean) * (v - mean)
-		}
-		variance /= float64(len(s.analytics.rollingWindow))
-		s.analytics.stdDev = math.Sqrt(variance)
-
-		// Z-score anomaly detection
-		if s.analytics.stdDev > 0 {
-			zScore := (rps - mean) / s.analytics.stdDev
-			if zScore > zScoreThreshold || zScore < -zScoreThreshold {
-				s.analytics.anomalyCount++
-				anomalyCounter.Inc()
-				log.Printf("Anomaly detected: RPS=%.2f, Z-score=%.2f, Mean=%.2f, StdDev=%.2f",
-					rps, zScore, mean, s.analytics.stdDev)
-			}
-		}
-	}
-
-	s.analytics.totalMetrics++
-	if s.analytics.totalMetrics > 0 {
-		s.analytics.anomalyRate = float64(s.analytics.anomalyCount) / float64(s.analytics.totalMetrics) * 100
-		anomalyRateGauge.Set(s.analytics.anomalyRate)
-	}
-}
-
-func (s *Service) getAnalytics(c *gin.Context) {
+func (service *Service) getAnalytics(c *gin.Context) {
 	start := time.Now()
-	s.analytics.mu.RLock()
-	defer s.analytics.mu.RUnlock()
+	service.mutex.RLock()
+	defer service.mutex.RUnlock()
 
 	response := gin.H{
-		"prediction":     s.analytics.prediction,
-		"window_size":    len(s.analytics.rollingWindow),
-		"total_metrics":  s.analytics.totalMetrics,
-		"anomaly_count":  s.analytics.anomalyCount,
-		"anomaly_rate":   s.analytics.anomalyRate,
-		"mean":           s.analytics.mean,
-		"std_dev":        s.analytics.stdDev,
-		"current_window": s.analytics.rollingWindow,
+		"prediction":    service.analytics.prediction,
+		"window_size":   50,
+		"total_count":   service.analytics.totalCount,
+		"anomaly_count": service.analytics.anomalyCount,
 	}
 
 	latencyHistogram.WithLabelValues("analyze").Observe(time.Since(start).Seconds())
 	c.JSON(http.StatusOK, response)
 }
 
-func (s *Service) health(c *gin.Context) {
-	status := http.StatusOK
-	health := gin.H{
-		"status": "healthy",
-		"redis":  "connected",
+func (service *Service) handleHealth(c *gin.Context) {
+	if err := service.redis.Ping(ctx).Err(); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status": "DOWN",
+		})
 	}
 
-	if err := s.redis.Ping(ctx).Err(); err != nil {
-		status = http.StatusServiceUnavailable
-		health["status"] = "unhealthy"
-		health["redis"] = "disconnected"
-	}
-
-	c.JSON(status, health)
+	c.JSON(http.StatusOK, gin.H{
+		"status": "UP",
+	})
 }
 
 func main() {
-	redisAddr := "localhost:6379"
-	if addr := getEnv("REDIS_ADDR", ""); addr != "" {
-		redisAddr = addr
-	}
+	redisAddr := GetEnv("REDIS_ADDR", "localhost:6379")
+	redisPass := GetEnv("REDIS_PASS", "")
 
-	service, err := NewService(redisAddr)
+	service, err := NewService(redisAddr, redisPass)
 	if err != nil {
 		log.Fatalf("Failed to initialize service: %v", err)
 	}
 
-	// Set Gin to release mode for production
-	if getEnv("GIN_MODE", "") == "release" {
-		gin.SetMode(gin.ReleaseMode)
-	}
+	route := gin.Default()
 
-	r := gin.Default()
+	route.GET("/health", service.handleHealth)
+	route.POST("/metrics", service.handleMetrics)
+	route.GET("/analyze", service.getAnalytics)
+	route.GET("/prometheus", gin.WrapH(promhttp.Handler()))
 
-	r.GET("/health", service.health)
-
-	r.POST("/metrics", service.ingestMetric)
-
-	r.GET("/analyze", service.getAnalytics)
-
-	r.GET("/metrics/prometheus", gin.WrapH(promhttp.Handler()))
-
-	port := getEnv("PORT", "8080")
-	log.Printf("Server starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, r))
-}
-
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
+	route.Run()
 }
