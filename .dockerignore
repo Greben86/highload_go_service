@@ -1,0 +1,9 @@
+.git/
+.gitignore
+.vscode/
+k8s/
+*.yaml
+*.yml
+jmeter/
+grafana/
+

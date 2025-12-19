@@ -51,12 +51,6 @@ var (
 	)
 )
 
-type Analytics struct {
-	totalCount   int64
-	anomalyCount int64
-	prediction   float64
-}
-
 type Service struct {
 	mutex     sync.RWMutex
 	redis     *redis.Client
@@ -73,7 +67,7 @@ func NewService(redisAddr string, password string) (*Service, error) {
 	})
 
 	if err := redis.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
+		return nil, fmt.Errorf("Failed to connect to Redis: %w", err)
 	}
 
 	return &Service{
@@ -131,7 +125,7 @@ func (service *Service) detectAnomaly(metricName string, newValue float64) bool 
 	stdDev, _ := strconv.ParseFloat(stdDevStr, 64)
 	zScore := (newValue - mean) / stdDev
 
-	return service.abs(zScore) > 3 // Если z-score превышает 3, считаем это аномалией
+	return service.abs(zScore) > 2 // Если z-score превышает 2, считаем это аномалией
 }
 
 // Вспомогательная функция для нахождения модуля числа
@@ -147,33 +141,35 @@ func (service *Service) handleMetrics(c *gin.Context) {
 	var m MetricDto
 	if err := c.ShouldBindJSON(&m); err != nil { // Привязываем тело запроса к структуре Metric
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		rpsCounter.WithLabelValues("error").Inc()
+		go rpsCounter.WithLabelValues("error").Inc()
 		return
 	}
 
-	// Сохраняем исходное значение в Redis
-	valueKey := fmt.Sprintf("%s:%d", m.Name, m.Timestamp)
-	service.redis.Set(ctx, valueKey, m.Value, time.Hour*24)
-
-	// Рассчитываем rolling average
-	var windowSize int64 = 10
-	avg := service.rollingAverage(m.Name, m.Value, windowSize)
-	fmt.Printf("Rolling avg for %s at timestamp %d is %.2f\n", m.Name, m.Timestamp, avg)
-
 	// Проверяем наличие аномалий
-	isAnomaly := service.detectAnomaly(m.Name, m.Value)
-	if isAnomaly {
-		service.analytics.anomalyCount++
-		anomalyCounter.Inc()
-		log.Printf("ANOMALY DETECTED: Value %f exceeds normal distribution bounds!\n", m.Value)
-	}
+	go func() {
+		// Сохраняем исходное значение в Redis
+		valueKey := fmt.Sprintf("%s:%d", m.Name, m.Timestamp)
+		service.redis.Set(ctx, valueKey, m.Value, time.Hour*24)
+
+		// Рассчитываем rolling average
+		var windowSize int64 = 10
+		avg := service.rollingAverage(m.Name, m.Value, windowSize)
+		fmt.Printf("Rolling avg for %s at timestamp %d is %.2f\n", m.Name, m.Timestamp, avg)
+
+		isAnomaly := service.detectAnomaly(m.Name, m.Value)
+		if isAnomaly {
+			service.analytics.anomalyCount++
+			anomalyCounter.Inc()
+			log.Printf("ANOMALY DETECTED: Value %f exceeds normal distribution bounds!\n", m.Value)
+		}
+	}()
 
 	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("Received metric '%s' with value %.2f", m.Name, m.Value)})
-	rpsCounter.WithLabelValues("success").Inc()
+	go rpsCounter.WithLabelValues("success").Inc()
 	service.analytics.totalCount++
 }
 
-func (service *Service) getAnalytics(c *gin.Context) {
+func (service *Service) handleAnalytics(c *gin.Context) {
 	start := time.Now()
 	service.mutex.RLock()
 	defer service.mutex.RUnlock()
@@ -214,7 +210,7 @@ func main() {
 
 	route.GET("/health", service.handleHealth)
 	route.POST("/metrics", service.handleMetrics)
-	route.GET("/analyze", service.getAnalytics)
+	route.GET("/analyze", service.handleAnalytics)
 	route.GET("/prometheus", gin.WrapH(promhttp.Handler()))
 
 	route.Run()
