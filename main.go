@@ -145,7 +145,7 @@ func (service *Service) handleMetrics(c *gin.Context) {
 		return
 	}
 
-	// Проверяем наличие аномалий
+	var ch = make(chan int64)
 	go func() {
 		// Сохраняем исходное значение в Redis
 		valueKey := fmt.Sprintf("%s:%d", m.Name, m.Timestamp)
@@ -156,13 +156,17 @@ func (service *Service) handleMetrics(c *gin.Context) {
 		avg := service.rollingAverage(m.Name, m.Value, windowSize)
 		fmt.Printf("Rolling avg for %s at timestamp %d is %.2f\n", m.Name, m.Timestamp, avg)
 
+		// Проверяем наличие аномалий
 		isAnomaly := service.detectAnomaly(m.Name, m.Value)
 		if isAnomaly {
-			service.analytics.anomalyCount++
+			ch <- 1
 			anomalyCounter.Inc()
 			log.Printf("ANOMALY DETECTED: Value %f exceeds normal distribution bounds!\n", m.Value)
+		} else {
+			ch <- 0
 		}
 	}()
+	service.analytics.anomalyCount += <-ch
 
 	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("Received metric '%s' with value %.2f", m.Name, m.Value)})
 	go rpsCounter.WithLabelValues("success").Inc()
