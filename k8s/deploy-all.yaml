@@ -12,7 +12,6 @@ metadata:
 data:
   REDIS_ADDR: "redis-service:6379"
   PORT: "8080"
-  GIN_MODE: "release"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -60,7 +59,7 @@ spec:
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
-        prometheus.io/path: "/metrics/prometheus"
+        prometheus.io/path: "/prometheus"
     spec:
       containers:
       - name: go-service
@@ -177,7 +176,7 @@ spec:
       app: go-service
   endpoints:
   - port: http
-    path: /metrics/prometheus
+    path: /prometheus
     interval: 15s
     scrapeTimeout: 10s
 
