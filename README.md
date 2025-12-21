@@ -1,4 +1,4 @@
-# Go Metrics Service
+# Highload Go Service with Metrics
 
 Сервис для обработки метрик с аналитикой и мониторингом.
 
@@ -17,7 +17,7 @@ curl http://localhost:8080/health
 
 Остановка:
 ```bash
-docker-compose down
+docker compose down
 ```
 
 ### В Kubernetes (Minikube)
@@ -31,12 +31,8 @@ minikube addons enable metrics-server
 
 2. Собрать образ:
 ```bash
-# Windows
-minikube docker-env | Invoke-Expression
-
-# Linux/Mac
+# Linux
 eval $(minikube docker-env)
-
 docker build -t go-service:latest .
 ```
 
@@ -126,7 +122,7 @@ kubectl get secret --namespace metrics-service prometheus-grafana \
 - Нажмите **Import**
 
 **Если дашборд пустой после импорта:**
-- Создайте дашборд вручную (см. файл `GRAFANA_MANUAL_SETUP.md`)
+- Создайте дашборд вручную 
 - Или откройте настройки дашборда (⚙️) → JSON Model → замените все `"uid": "prometheus"` на UID вашего источника данных
 
 #### Шаг 3: Проверка
@@ -134,14 +130,6 @@ kubectl get secret --namespace metrics-service prometheus-grafana \
 - В Dashboards → Browse должны появиться дашборды
 - Данные начнут появляться через несколько секунд после отправки метрик
 - Отправьте тестовую метрику, чтобы увидеть данные
-
-## Нагрузочное тестирование
-
-```bash
-pip install locust
-cd locust
-locust --headless --users 20 --spawn-rate 4 --run-time 5m --host http://localhost:8080
-```
 
 ## Что умеет сервис
 
@@ -155,9 +143,9 @@ locust --headless --users 20 --spawn-rate 4 --run-time 5m --host http://localhos
 
 ```
 .
-├── main.go              # Основной код
-├── docker-compose.yml   # Локальный запуск
-├── Dockerfile           # Образ для Kubernetes
-├── k8s/                 # Kubernetes манифесты
-└── locust/              # Нагрузочное тестирование
+├── main.go       # Основной код
+├── compose.yml   # Локальный запуск
+├── Dockerfile    # Образ для Kubernetes
+├── k8s/          # Kubernetes манифесты
+└── jmeter/       # Нагрузочное тестирование
 ```
